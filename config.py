@@ -6,7 +6,7 @@ import os
 from dotenv import load_dotenv
 
 # 加载环境变量
-load_dotenv(override=True)
+load_dotenv()
 
 # 基础配置
 class Config:
@@ -34,3 +34,12 @@ class Config:
     # 缓存配置
     ENABLE_CACHE = os.getenv("ENABLE_CACHE", "True").lower() == "true"
     CACHE_EXPIRATION = int(os.getenv("CACHE_EXPIRATION", 86400))  # 默认缓存24小时
+    
+    # 备用API配置（可选）
+    BACKUP_OPENAI_API_KEY = os.getenv("BACKUP_OPENAI_API_KEY", "")
+    BACKUP_OPENAI_MODEL = os.getenv("BACKUP_OPENAI_MODEL", "gpt-3.5-turbo")
+    BACKUP_OPENAI_API_BASE = os.getenv("BACKUP_OPENAI_API_BASE", "https://api.openai.com/v1")
+    
+    # 代理配置（可选）
+    OPENAI_PROXY = os.getenv("OPENAI_PROXY", "")
+    BACKUP_OPENAI_PROXY = os.getenv("BACKUP_OPENAI_PROXY", "")

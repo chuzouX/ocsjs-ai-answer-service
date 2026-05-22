@@ -12,6 +12,7 @@ import time
 import logging
 import openai
 import json
+import httpx
 from datetime import datetime
 
 from config import Config
@@ -36,11 +37,38 @@ if not Config.OPENAI_API_KEY:
     logger.critical("未设置OpenAI API密钥，请在.env文件中配置OPENAI_API_KEY")
     raise ValueError("请设置环境变量OPENAI_API_KEY")
 
+def create_openai_client(api_key, base_url, proxy_url=""):
+    """创建OpenAI客户端，可选配置代理"""
+    client_args = {
+        "api_key": api_key,
+        "base_url": base_url
+    }
+    
+    if proxy_url:
+        logger.info(f"使用代理: {proxy_url}")
+        http_client = httpx.Client(proxy=proxy_url)
+        client_args["http_client"] = http_client
+    
+    return openai.OpenAI(**client_args)
+
 # 初始化OpenAI客户端
-client = openai.OpenAI(
+client = create_openai_client(
     api_key=Config.OPENAI_API_KEY,
-    base_url=Config.OPENAI_API_BASE
+    base_url=Config.OPENAI_API_BASE,
+    proxy_url=Config.OPENAI_PROXY
 )
+
+# 初始化备用OpenAI客户端（如果配置了备用API密钥）
+backup_client = None
+if Config.BACKUP_OPENAI_API_KEY:
+    backup_client = create_openai_client(
+        api_key=Config.BACKUP_OPENAI_API_KEY,
+        base_url=Config.BACKUP_OPENAI_API_BASE,
+        proxy_url=Config.BACKUP_OPENAI_PROXY
+    )
+    logger.info(f"备用API已启用 (模型: {Config.BACKUP_OPENAI_MODEL})")
+else:
+    logger.info("备用API未配置")
 
 # 问答记录存储（实际应用中可以使用数据库）
 qa_records = []
@@ -121,39 +149,101 @@ def search():
         # 构建发送给OpenAI的提示
         prompt = parse_question_and_options(question, options, question_type)
         
-        # 调用OpenAI API
-        response = client.chat.completions.create(
-            model=Config.OPENAI_MODEL,
-            temperature=Config.TEMPERATURE,
-            max_tokens=Config.MAX_TOKENS,
-            messages=[
-                {"role": "system", "content": "你是一个专业的考试答题助手。请直接回答答案，不要解释。选择题只回答选项的内容(如：地球)；多选题用#号分隔答案,只回答选项的内容(如中国#世界#地球)；判断题只回答: 正确/对/true/√ 或 错误/错/false/×；填空题直接给出答案。"},
-                {"role": "user", "content": prompt}
-            ]
-        )
+        processed_answer = ""
+        ai_answer = ""
         
-        # 获取AI生成的答案
-        ai_answer = response.choices[0].message.content.strip()
+        # 首先尝试主API
+        logger.info("尝试主API...")
+        try:
+            response = client.chat.completions.create(
+                model=Config.OPENAI_MODEL,
+                temperature=Config.TEMPERATURE,
+                max_tokens=Config.MAX_TOKENS,
+                messages=[
+                    {"role": "system", "content": "你是一个专业的考试答题助手。请直接回答答案，不要解释。选择题只回答选项的内容(如：地球)；多选题用#号分隔答案,只回答选项的内容(如中国#世界#地球)；判断题只回答: 正确/对/true/√ 或 错误/错/false/×；填空题直接给出答案。"},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            
+            # 获取AI生成的答案
+            ai_answer = response.choices[0].message.content.strip()
+            processed_answer = extract_answer(ai_answer, question_type)
+            
+            # 检查主API答案是否为空
+            if processed_answer and processed_answer.strip():
+                logger.info("主API成功获取答案")
+            else:
+                logger.warning("主API返回空答案，尝试备用API...")
+                
+                # 如果有备用API，尝试备用API
+                if backup_client:
+                    try:
+                        backup_response = backup_client.chat.completions.create(
+                            model=Config.BACKUP_OPENAI_MODEL,
+                            temperature=Config.TEMPERATURE,
+                            max_tokens=Config.MAX_TOKENS,
+                            messages=[
+                                {"role": "system", "content": "你是一个专业的考试答题助手。请直接回答答案，不要解释。选择题只回答选项的内容(如：地球)；多选题用#号分隔答案,只回答选项的内容(如中国#世界#地球)；判断题只回答: 正确/对/true/√ 或 错误/错/false/×；填空题直接给出答案。"},
+                                {"role": "user", "content": prompt}
+                            ]
+                        )
+                        
+                        ai_answer = backup_response.choices[0].message.content.strip()
+                        processed_answer = extract_answer(ai_answer, question_type)
+                        
+                        if processed_answer and processed_answer.strip():
+                            logger.info("备用API成功获取答案")
+                        else:
+                            logger.warning("备用API也返回空答案，跳过")
+                    except Exception as e:
+                        logger.error(f"备用API调用失败: {str(e)}，跳过")
+                else:
+                    logger.warning("未配置备用API，跳过")
+        except Exception as e:
+            logger.error(f"主API调用失败: {str(e)}，尝试备用API...")
+            
+            # 主API调用失败，尝试备用API
+            if backup_client:
+                try:
+                    backup_response = backup_client.chat.completions.create(
+                        model=Config.BACKUP_OPENAI_MODEL,
+                        temperature=Config.TEMPERATURE,
+                        max_tokens=Config.MAX_TOKENS,
+                        messages=[
+                            {"role": "system", "content": "你是一个专业的考试答题助手。请直接回答答案，不要解释。选择题只回答选项的内容(如：地球)；多选题用#号分隔答案,只回答选项的内容(如中国#世界#地球)；判断题只回答: 正确/对/true/√ 或 错误/错/false/×；填空题直接给出答案。"},
+                            {"role": "user", "content": prompt}
+                        ]
+                    )
+                    
+                    ai_answer = backup_response.choices[0].message.content.strip()
+                    processed_answer = extract_answer(ai_answer, question_type)
+                    
+                    if processed_answer and processed_answer.strip():
+                        logger.info("备用API成功获取答案")
+                    else:
+                        logger.warning("备用API也返回空答案，跳过")
+                except Exception as backup_e:
+                    logger.error(f"备用API也调用失败: {str(backup_e)}，跳过")
+            else:
+                logger.warning("未配置备用API，跳过")
         
-        # 处理答案格式
-        processed_answer = extract_answer(ai_answer, question_type)
-        
-        # 保存到缓存
-        if Config.ENABLE_CACHE:
+        # 保存到缓存（只有答案不为空时才缓存）
+        if Config.ENABLE_CACHE and processed_answer and processed_answer.strip():
             cache.set(question, processed_answer, question_type, options)
         
-        # 保存问答记录
-        current_time = datetime.now()
-        qa_records.append({
-            'time': current_time.strftime('%Y-%m-%d %H:%M:%S'),
-            'timestamp': current_time.isoformat(),
-            'question': question,
-            'type': question_type,
-            'options': options,
-            'answer': processed_answer
-        })
-        if len(qa_records) > MAX_RECORDS:
-            qa_records.pop(0)
+        # 保存问答记录（只有答案不为空时才保存）
+        if processed_answer and processed_answer.strip():
+            current_time = datetime.now()
+            qa_records.append({
+                'time': current_time.strftime('%Y-%m-%d %H:%M:%S'),
+                'timestamp': current_time.isoformat(),
+                'question': question,
+                'type': question_type,
+                'options': options,
+                'answer': processed_answer
+            })
+            if len(qa_records) > MAX_RECORDS:
+                qa_records.pop(0)
         
         # 记录处理时间
         process_time = time.time() - start_time
